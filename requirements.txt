@@ -1,0 +1,29 @@
+# ============================================================
+# RUNTIME SAJA — retrieval + generation + UI
+# (Persiapan korpus, OCR/parsing dokumen, dan evaluasi TIDAK disertakan
+#  karena tidak dijalankan lagi setelah FAISS index sudah jadi)
+# ============================================================
+
+# Core RAG & LangChain
+langchain
+langchain-community
+langchain-huggingface
+langchain-core
+
+# Vector store — load index yang sudah jadi (bukan untuk build index baru)
+faiss-cpu
+
+# Environment
+python-dotenv
+
+# Model & embedding
+torch
+sentence-transformers
+transformers
+accelerate
+bitsandbytes>=0.46.1
+openai
+
+# UI
+gradio
+pyngrok
