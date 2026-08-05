@@ -1,43 +1,37 @@
 """
 StuntBot — Sistem Tanya Jawab RAG Seputar Stunting
-- Generation: OpenRouter API (Qwen 2.5 7B Instruct), bukan model lokal
-- Antarmuka: Gradio + ngrok (untuk demo lokal saat sidang)
+- Antarmuka Gradio (Cell 9), tanpa bagian ngrok
 """
 
 import os
+import torch
 from typing import List, Dict
 
 from dotenv import load_dotenv
-load_dotenv()  # membaca file .env di folder yang sama saat run lokal
+load_dotenv()  # hanya efektif untuk development lokal;
+               # di HuggingFace Spaces, Repository Secrets otomatis
+               # tersedia sebagai environment variable tanpa perlu file .env
 
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-from openai import OpenAI
-from pyngrok import ngrok, conf
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
 import gradio as gr
 
 # ============================================================
-# 1. KONFIGURASI (dibaca dari file .env)
+# 1. KONFIGURASI (dibaca dari environment variable / secrets)
 # ============================================================
+HF_TOKEN            = os.environ.get("HF_TOKEN")                 # wajib diisi via Secrets
 FAISS_FOLDER        = os.environ.get("FAISS_FOLDER", "faiss_index")
+MODEL_ID            = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
 EMBEDDING_MODEL_ID  = os.environ.get("EMBEDDING_MODEL_ID", "intfloat/multilingual-e5-base")
 
-OPENROUTER_API_KEY  = os.environ.get("OPENROUTER_API_KEY")
-OPENROUTER_MODEL_ID = os.environ.get("OPENROUTER_MODEL_ID", "qwen/qwen-2.5-7b-instruct")
-NGROK_TOKEN         = os.environ.get("NGROK_TOKEN")
-
-if not OPENROUTER_API_KEY:
-    raise EnvironmentError("OPENROUTER_API_KEY belum diset. Cek file .env.")
-if not NGROK_TOKEN:
-    raise EnvironmentError("NGROK_TOKEN belum diset. Cek file .env.")
-
-device = "cpu"  # embedding model cukup di CPU, LLM generasi via OpenRouter (tidak butuh GPU)
-print(f"Perangkat        : {device.upper()}")
-print(f"Model LLM        : {OPENROUTER_MODEL_ID} (via OpenRouter)")
-print(f"Embedding        : {EMBEDDING_MODEL_ID}")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Perangkat  : {device.upper()}")
+print(f"Model LLM  : {MODEL_ID}")
+print(f"Embedding  : {EMBEDDING_MODEL_ID}")
 
 # ============================================================
 # 2. LOAD EMBEDDING MODEL + FAISS INDEX (tanpa proses embedding ulang)
@@ -150,53 +144,41 @@ def retrieve_raw_docs(user_query: str, top_k: int = 5):
 
 
 # ============================================================
-# 4. GENERATION — QWEN 2.5 7B INSTRUCT VIA OPENROUTER
+# 4. GENERATION — QWEN 2.5 7B INSTRUCT (identik dengan Cell 7)
 # ============================================================
-openrouter_client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True,
 )
-print(f"Client OpenRouter siap. Model: {OPENROUTER_MODEL_ID}")
 
+print(f"Memuat model: {MODEL_ID}...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
 
-def _parse_chatml(full_text: str) -> tuple:
-    """
-    Prompt di bawah ini masih ditulis dalam format ChatML (<|im_start|>...)
-    supaya isi instruksi/aturan (LARANGAN KERAS dkk) tidak perlu ditulis ulang.
-    Fungsi ini hanya memecahnya jadi system_content & user_content untuk
-    dikirim sebagai messages[] ke Chat Completions API (OpenRouter/OpenAI-compatible).
-    """
-    sys_start = full_text.find("<|im_start|>system") + len("<|im_start|>system")
-    sys_end   = full_text.find("<|im_end|>", sys_start)
-    system_content = full_text[sys_start:sys_end].strip()
+_model_kwargs = dict(device_map="auto", token=HF_TOKEN, trust_remote_code=True)
+if device == "cuda":
+    # Kuantisasi 4-bit hanya didukung di GPU. Di Space CPU-only, bagian ini
+    # dilewati otomatis (lihat catatan GPU di README / panduan deployment).
+    _model_kwargs["quantization_config"] = bnb_config
 
-    usr_start = full_text.find("<|im_start|>user", sys_end) + len("<|im_start|>user")
-    usr_end   = full_text.find("<|im_end|>", usr_start)
-    user_content = full_text[usr_start:usr_end].strip()
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **_model_kwargs)
+print("Model Qwen 2.5 berhasil dimuat.")
 
-    return system_content, user_content
+text_generation_pipeline = pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    max_new_tokens=1024,
+    temperature=0.1,
+    top_p=0.95,
+    repetition_penalty=1.15,
+    return_full_text=False,
+)
 
+llm_qwen = HuggingFacePipeline(pipeline=text_generation_pipeline)
 
-def call_qwen_openrouter(full_chatml_text: str) -> str:
-    system_content, user_content = _parse_chatml(full_chatml_text)
-
-    response = openrouter_client.chat.completions.create(
-        model=OPENROUTER_MODEL_ID,
-        messages=[
-            {"role": "system", "content": system_content},
-            {"role": "user",   "content": user_content},
-        ],
-        temperature=0.1,
-        top_p=0.95,
-        max_tokens=1024,
-    )
-    return response.choices[0].message.content.strip()
-
-
-llm_qwen = RunnableLambda(call_qwen_openrouter)
-
-# Prompt template — isinya identik dengan Cell 7, format ChatML dipertahankan
-# hanya untuk dipecah oleh _parse_chatml() di atas.
+# Prompt template — identik dengan Cell 7
 prompt_template_qwen = """<|im_start|>system
 # PERAN DAN IDENTITAS
 Anda adalah StuntBot, asisten tanya-jawab berbasis kecerdasan buatan yang \
@@ -509,27 +491,10 @@ Sistem tanya jawab stunting berbasis RAG
 
 
 # ============================================================
-# 6. LAUNCH (lokal + ngrok, untuk demo sidang)
+# 6. LAUNCH
 # ============================================================
+# Catatan: di HuggingFace Spaces, server_name/server_port ditangani otomatis
+# oleh platform. Parameter di bawah aman untuk Spaces maupun run lokal.
 if __name__ == "__main__":
-    PORT = int(os.environ.get("PORT", 7860))
-
-    gr.close_all()
-    os.system(f"fuser -k {PORT}/tcp")  # bebaskan port kalau ada proses lama nyangkut
-
-    try:
-        conf.get_default().auth_token = NGROK_TOKEN
-        ngrok.kill()  # pastikan tidak ada tunnel lama yang masih nyangkut
-    except Exception as e:
-        print(f"Warning Ngrok: {e}")
-
     demo.queue()
-
-    try:
-        public_url = ngrok.connect(PORT).public_url
-        print(f"Aplikasi online: {public_url}")
-        print("Buka link di atas di browser. Klik 'Visit Site' kalau muncul halaman peringatan ngrok.")
-    except Exception as e:
-        print(f"Error Ngrok: {e}")
-
-    demo.launch(server_name="0.0.0.0", server_port=PORT, share=False)
+    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
